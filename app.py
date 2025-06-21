@@ -31,6 +31,10 @@ class QueryInput(BaseModel):
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     global retriever
+    data_dir = "data"
+    if not os.path.exists(data_dir):
+        os.makedirs(data_dir)
+
     file_path = f"data/{file.filename}"
     with open(file_path, "wb") as f:
         f.write(await file.read())

@@ -4,3 +4,6 @@ langchain
 openai
 chromadb
 python-dotenv
+streamlit
+requests
+tiktoken
