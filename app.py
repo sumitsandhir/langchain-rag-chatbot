@@ -1,123 +1,141 @@
 import os
 from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
-from langchain.chat_models import ChatOpenAI
+from langchain.embeddings import HuggingFaceEmbeddings, OpenAIEmbeddings
 from langchain.vectorstores import Chroma
 from langchain.document_loaders import TextLoader, PyPDFLoader, UnstructuredMarkdownLoader
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.chains import ConversationalRetrievalChain
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.memory import ConversationBufferMemory
-from dotenv import load_dotenv
-import requests
-import json
+from langchain.chat_models import ChatOpenAI
+from langchain.chains import RetrievalQA
 
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-LOCAL_LLAMA_ENDPOINT = "http://localhost:11434"  # Updated to correct URL
-
-if not OPENAI_API_KEY and not LOCAL_LLAMA_ENDPOINT:
-    raise EnvironmentError("❌ No valid LLM configuration found. Set OPENAI_API_KEY or a local Llama endpoint.")
-
+# Initialize FastAPI app
 app = FastAPI()
 
-# Use OpenAIEmbeddings, if API key is available
-embedding = OpenAIEmbeddings() if OPENAI_API_KEY else None
-llm = ChatOpenAI(model="gpt-4", temperature=0) if OPENAI_API_KEY else None
+# Initialize global variables
 retriever = None
-memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+hf_embeddings = None
+use_openai = False
+
+# Check for OpenAI API Key in the environment
+if os.getenv("OPENAI_API_KEY"):
+    try:
+        # Prefer OpenAI embeddings if the API key exists
+        print("🔑 OpenAI API key detected. Initializing OpenAI embeddings...")
+        hf_embeddings = OpenAIEmbeddings()  # Leverage OpenAI for embeddings
+        use_openai = True
+        print("✅ OpenAI embeddings initialized.")
+    except Exception as e:
+        print(f"❌ Error initializing OpenAI embeddings: {e}")
+else:
+    try:
+        # Fallback to HuggingFace embeddings if no OpenAI API key is found
+        print("🔍 No OpenAI API key found. Using HuggingFace embeddings...")
+        hf_embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        print("✅ HuggingFace embeddings initialized successfully.")
+    except Exception as e:
+        print(f"❌ Error initializing HuggingFace embeddings: {e}")
+        hf_embeddings = None
 
 
 class QueryInput(BaseModel):
+    """Schema for questions."""
     question: str
 
 
 @app.post("/upload")
-async def upload_file( file: UploadFile = File(...) ):
+async def upload_file(file: UploadFile = File(...)):
+    """
+    Endpoint to handle document upload and retriever setup.
+    """
     global retriever
+
+    if not hf_embeddings:
+        return {"error": "Embeddings could not be initialized. Please check your environment settings."}
+
+    # Ensure persistent storage for file storage
     data_dir = "data"
     if not os.path.exists(data_dir):
         os.makedirs(data_dir)
 
-    file_path = f"data/{file.filename}"
+    # Save the uploaded file locally
+    file_path = os.path.join(data_dir, file.filename)
     with open(file_path, "wb") as f:
         f.write(await file.read())
 
-    ext = file.filename.split('.')[-1].lower()
-    if ext == 'pdf':
+    # Detect the file type and use the appropriate loader
+    ext = file.filename.split(".")[-1].lower()
+    if ext == "pdf":
         loader = PyPDFLoader(file_path)
-    elif ext == 'md':
+    elif ext == "md":
         loader = UnstructuredMarkdownLoader(file_path)
     else:
         loader = TextLoader(file_path)
 
+    # Load the document
     documents = loader.load()
+    print(f"✅ Loaded document: {file.filename}")
+
+    # Split the document into smaller chunks
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     texts = text_splitter.split_documents(documents)
+    print(f"✅ Document split into {len(texts)} chunks.")
 
-    db = Chroma.from_documents(texts, embedding, persist_directory="chroma_store") if embedding else None
-    if db:
+    # Initialize Chroma database
+    try:
+        db = Chroma(
+            collection_name="document_index",
+            persist_directory="chroma_store",
+            embedding_function=hf_embeddings,
+        )
+        db.add_texts([doc.page_content for doc in texts])
         db.persist()
-        retriever = db.as_retriever()
-    else:
-        retriever = None
 
-    return {"message": f"Uploaded and indexed {file.filename}"}
+        # Set up a retriever for querying
+        retriever = db.as_retriever()
+        print("✅ ChromaDB retriever initialized successfully.")
+        return {"message": f"File '{file.filename}' has been uploaded and indexed."}
+
+    except Exception as e:
+        print(f"❌ Error initializing ChromaDB: {e}")
+        retriever = None
+        return {"error": f"ChromaDB initialization failed: {e}"}
 
 
 @app.post("/ask")
 async def ask_question(query: QueryInput):
-    global retriever
+    """
+    Endpoint to handle user questions with a fallback between OpenAI and local LLaMA.
+    """
+    global retriever, use_openai
 
+    if not retriever:
+        return {"error": "No document has been uploaded or retriever is not initialized."}
+
+    # Ensure OpenAI key fallback logic during question answering
     try:
-        # Attempt to use OpenAI
-        if retriever and llm:
-            qa = ConversationalRetrievalChain.from_llm(llm=llm, retriever=retriever, memory=memory)
-            result = qa.run(query.question)
-            return {"answer": result}  # Always return "answer"
+        if use_openai:
+            # Use OpenAI's GPT model if OpenAI embeddings are used
+            print("🧠 Using OpenAI GPT for question answering...")
+            openai_qa_model = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
+            qa_chain = RetrievalQA.from_chain_type(
+                retriever=retriever,
+                llm=openai_qa_model,
+                chain_type="stuff",
+            )
+            answer = qa_chain.run(query.question)
+        else:
+            # Use fallback logic for local answers
+            print("⚙️ Using local retriever for response...")
+            retrieved_docs = retriever.get_relevant_documents(query.question)
+            if not retrieved_docs:
+                return {
+                    "answer": "No relevant information found. Try uploading a relevant document or rephrasing your question."
+                }
+            context = " ".join([doc.page_content for doc in retrieved_docs[:3]])
+            answer = f"Relevant context:\n{context}"
+
+        return {"answer": answer}
+
     except Exception as e:
-        # Log the OpenAI error and proceed to fallback
-        print(f"OpenAI Error: {e}")
-
-    try:
-        # Query the Local Llama server
-        response = requests.post(
-            f"{LOCAL_LLAMA_ENDPOINT}/api/generate",
-            json={
-                "model": "llama2",  # Replace with your configured model name
-                "prompt": f"You are an expert assistant. Answer the following question concisely:\n\n{query.question}",
-                "temperature": 0.7,
-            },
-            stream=False,
-        )
-
-        # Print the raw response content for debugging
-        print("Raw Response Content:", response.text)
-        response.raise_for_status()  # Raise for HTTP error status codes
-
-        # Parse JSONL response (handle multiple JSON objects)
-        full_response = ""
-        for line in response.text.splitlines():
-            try:
-                json_obj = json.loads(line)   # Parse each JSON object
-                full_response += json_obj.get("response", "")  # Extract the "response" field
-                if json_obj.get("done"):      # Stop if streaming is marked as "done"
-                    break
-            except json.JSONDecodeError:
-                # Handle malformed JSON lines if needed
-                print("Warning: Skipped invalid JSON line:", line)
-                continue
-
-        return {
-            "answer": full_response.strip()  # Return the combined response
-        }
-
-    except requests.exceptions.RequestException as e:
-        # Handle HTTP-related exceptions
-        print("Request Exception:", e)
-        return {"error": f"Failed to query local Llama: {str(e)}"}
-
-    except ValueError as e:
-        # Handle JSON decoding errors
-        print("JSON Decode Error:", e)
-        return {"error": f"Invalid JSON from Local Llama: {response.text}"}
+        print(f"❌ Error during question answering: {e}")
+        return {"error": "An error occurred while processing your query. Please try again later."}
