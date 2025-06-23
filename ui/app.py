@@ -18,8 +18,21 @@ if uploaded_file:
 question = st.text_input("Ask a question:")
 if question:
     with st.spinner("Thinking..."):
-        response = requests.post("http://localhost:8000/ask", json={"question": question})
-        if response.ok:
-            st.markdown(f"**Answer:** {response.json()['answer']}")
-        else:
-            st.error("Error: " + response.text)
+        try:
+            # Send the question to the backend
+            response = requests.post("http://localhost:8000/ask", json={"question": question})
+            response.raise_for_status()  # Raise an exception for HTTP errors
+
+            # Parse the response
+            data = response.json()
+
+            # Safely handle the backend response
+            if "answer" in data:
+                st.markdown(f"**Answer:** {data['answer']}")
+            elif "error" in data:
+                st.error(f"Error: {data['error']}")
+            else:
+                st.error("Unexpected response format from the server.")
+        except Exception as e:
+            # Handle any request exceptions
+            st.error(f"Request failed: {str(e)}")
