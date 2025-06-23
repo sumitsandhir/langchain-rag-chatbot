@@ -1,9 +1,12 @@
-fastapi
+langchain-chroma
+sentence-transformers~=4.1.0
+fastapi~=0.115.13
 uvicorn
-langchain
-openai
 chromadb
 python-dotenv
-streamlit
-requests
+streamlit~=1.46.0
+requests~=2.32.4
 tiktoken
+openai
+langchain
+pydantic~=2.11.7
